@@ -295,7 +295,7 @@ elif selected_page == "Compare models":
                     tf.keras.backend.clear_session()
                 except Exception as exc:
                     errors.append(f"{name}: {exc}")
-                progress.progress((i+1)/len(available_models))
+                progress.progress((i+1)/len(model_names))
             if rows:
                 st.session_state["model_comparison"] = pd.DataFrame(rows)
             if errors:
