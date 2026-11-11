@@ -17,6 +17,8 @@ from PIL import Image, ImageOps
 
 BASE_DIR = Path(__file__).resolve().parent
 MODEL_DIR = Path(os.getenv("DEEPTRASH_MODEL_DIR", str(BASE_DIR / "models")))
+HF_REPO_ID = "LNaorinN/deeptrash-models"
+HF_REVISION = os.getenv("DEEPTRASH_HF_REVISION", "main")
 DATA_DIR = Path(os.getenv("DEEPTRASH_DATA_DIR", str(BASE_DIR / "data")))
 DB_PATH = DATA_DIR / "deeptrash_history.sqlite3"
 METRICS_PATH = BASE_DIR / "evaluation" / "test_model_comparison.csv"
@@ -27,6 +29,12 @@ MODEL_FILES = {
     "EfficientNetV2S": ["EfficientNetV2S.keras", "TrashNet_EfficientNetV2S.keras"],
     "MobileNetV3Large": ["MobileNetV3Large.keras", "TrashNet_MobileNetV3Large.keras"],
     "ConvNeXtTiny": ["ConvNeXtTiny.keras", "TrashNet_ConvNeXtTiny.keras"],
+}
+HF_MODEL_FILES = {
+    "DenseNet121": "DenseNet121.keras",
+    "EfficientNetV2S": "EfficientNetV2S.keras",
+    "MobileNetV3Large": "MobileNetV3Large.keras",
+    "ConvNeXtTiny": "ConvNeXtTiny.keras",
 }
 MODEL_INFO = {
     "DenseNet121": "DenseNet121 · transfer learning",
@@ -98,6 +106,7 @@ def read_history(limit=None):
     return df
 
 def discover_models():
+    """Find model files already present in the configured model directory."""
     found = {}
     for name, candidates in MODEL_FILES.items():
         for candidate in candidates:
@@ -106,6 +115,40 @@ def discover_models():
                 found[name] = path
                 break
     return found
+
+
+def ensure_model_available(model_name: str) -> Path:
+    """Download only the selected model from Hugging Face when it is not local yet."""
+    if model_name not in HF_MODEL_FILES:
+        raise ValueError(f"Unknown model: {model_name}")
+
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    local_path = MODEL_DIR / HF_MODEL_FILES[model_name]
+    if local_path.is_file() and local_path.stat().st_size > 0:
+        return local_path
+
+    try:
+        from huggingface_hub import hf_hub_download
+        downloaded_path = hf_hub_download(
+            repo_id=HF_REPO_ID,
+            filename=HF_MODEL_FILES[model_name],
+            repo_type="model",
+            revision=HF_REVISION,
+            local_dir=str(MODEL_DIR),
+            token=os.getenv("HF_TOKEN") or None,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not download {HF_MODEL_FILES[model_name]} from "
+            f"Hugging Face ({HF_REPO_ID}). Check that the repository and file "
+            "are public, the filename is correct, and the deployment has internet access. "
+            "If the repository is private or gated, add HF_TOKEN to Streamlit Secrets."
+        ) from exc
+
+    downloaded_path = Path(downloaded_path)
+    if not downloaded_path.is_file() or downloaded_path.stat().st_size == 0:
+        raise RuntimeError(f"Hugging Face returned an empty or missing model file: {downloaded_path}")
+    return downloaded_path
 
 @st.cache_resource(show_spinner=False, max_entries=1)
 def load_model(model_path: str, modified_time: float):
@@ -144,19 +187,10 @@ def chart_probabilities(probabilities):
                              "Model score": [v * 100 for v in probabilities.values()]})
     st.bar_chart(chart_df.set_index("Waste category"), horizontal=True, height=250)
 
-def model_asset_help():
-    st.warning("No trained model files were detected.")
-    st.markdown(
-        "Run the merged Kaggle notebook, download **DeepTrash_All_Models.zip**, "
-        "and extract the four `.keras` files into this project's `models/` folder. "
-        "The model files are not bundled here because they must come from your training run."
-    )
-    st.code("models/\\n  DenseNet121.keras\\n  EfficientNetV2S.keras\\n  MobileNetV3Large.keras\\n  ConvNeXtTiny.keras")
-
 available_models = discover_models()
-if not available_models:
-    model_asset_help()
-    st.stop()
+
+# All four models are selectable; the selected file is fetched from Hugging Face on demand.
+model_names = list(MODEL_FILES.keys())
 
 # Class label integrity: compare bundled labels if supplied.
 labels_file = MODEL_DIR / "class_names.json"
@@ -176,8 +210,9 @@ selected_page = st.sidebar.radio("Navigation", pages)
 st.sidebar.markdown("---")
 st.sidebar.markdown("**Available models**")
 for model_name in MODEL_FILES:
-    st.sidebar.write(("🟢 " if model_name in available_models else "⚪ ") + model_name)
-st.sidebar.caption(f"{len(available_models)} of 4 model files found")
+    status = "🟢" if model_name in available_models else "☁️"
+    st.sidebar.write(f"{status} {model_name}")
+st.sidebar.caption(f"{len(available_models)} of 4 models already downloaded · others download when selected")
 st.sidebar.markdown("---")
 st.sidebar.caption("Research prototype · TrashNet six-class classification")
 
@@ -187,7 +222,7 @@ if selected_page == "Classify waste":
     st.title("Classify a waste item")
     left, right = st.columns([1.05, .95], gap="large")
     with left:
-        chosen_model = st.selectbox("Prediction model", list(available_models.keys()))
+        chosen_model = st.selectbox("Prediction model", model_names)
         source = st.radio("Choose image source", ["Upload image", "Take a photo"], horizontal=True)
         if source == "Upload image":
             uploaded = st.file_uploader("Upload a waste photo", type=["jpg","jpeg","png","webp"])
@@ -200,8 +235,10 @@ if selected_page == "Classify waste":
                 st.image(image, caption="Image submitted for classification", use_container_width=True)
                 classify = st.button("Identify waste", type="primary", use_container_width=True)
             if classify:
+                with st.spinner(f"Preparing {chosen_model} (downloading on first use if needed)..."):
+                    model_path = ensure_model_available(chosen_model)
                 with st.spinner(f"Running {chosen_model}..."):
-                    label, confidence, probs, elapsed = run_prediction(image, chosen_model, available_models[chosen_model])
+                    label, confidence, probs, elapsed = run_prediction(image, chosen_model, model_path)
                 save_prediction(getattr(uploaded, "name", "camera_capture"), chosen_model, label, confidence, probs, elapsed)
                 st.session_state["latest_prediction"] = {
                     "label":label,"confidence":confidence,"probs":probs,
@@ -245,9 +282,10 @@ elif selected_page == "Compare models":
         if st.button("Compare available models", type="primary"):
             rows, errors = [], []
             progress = st.progress(0)
-            for i, (name, path) in enumerate(available_models.items()):
+            for i, name in enumerate(model_names):
                 try:
-                    with st.spinner(f"Evaluating {name}..."):
+                    with st.spinner(f"Preparing and evaluating {name}..."):
+                        path = ensure_model_available(name)
                         label, conf, probs, elapsed = run_prediction(compare_image, name, path)
                     rows.append({"Model":name,"Predicted class":label,"Confidence (%)":round(conf*100,2),
                                  "Inference (ms)":round(elapsed,2),
@@ -326,14 +364,14 @@ elif selected_page == "Admin dashboard":
         total = len(history)
         c1,c2,c3,c4 = st.columns(4)
         c1.metric("Total classifications", total)
-        c2.metric("Models available", f"{len(available_models)}/4")
+        c2.metric("Models downloaded", f"{len(discover_models())}/4")
         c3.metric("Categories observed", history["predicted_class"].nunique() if total else 0)
         c4.metric("Mean confidence", f"{history['confidence'].mean()*100:.1f}%" if total else "—")
         st.subheader("Model files")
         model_status = []
         for name in MODEL_FILES:
-            path = available_models.get(name)
-            model_status.append({"Model":name,"Status":"Available" if path else "Missing",
+            path = discover_models().get(name)
+            model_status.append({"Model":name,"Status":"Downloaded" if path else "Not downloaded (available on Hugging Face)",
                                  "File size (MB)":round(path.stat().st_size/1024**2,1) if path else None})
         st.dataframe(pd.DataFrame(model_status), use_container_width=True, hide_index=True)
         if total:
@@ -374,7 +412,7 @@ elif selected_page == "Project & methodology":
 **Limitations.** TrashNet is a constrained image dataset. Real-world performance may differ under new lighting, backgrounds, camera devices, mixed waste, occlusion and local packaging variations. Confidence is a model score, not a calibrated guarantee. The app's disposal advice is generic and must be checked against local rules.
 """)
     st.subheader("Model files detected")
-    st.write({name: str(path.name) for name,path in available_models.items()})
+    st.write({name: str(path.name) for name,path in discover_models().items()})
     st.subheader("Suggested thesis evaluation")
     st.markdown("""
 1. Keep a held-out test set separate from training and validation.
